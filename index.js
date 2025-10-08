@@ -1,57 +1,45 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const crypto = require("crypto");
+import express from "express";
+import bodyParser from "body-parser";
+import crypto from "crypto";
 
 const app = express();
-const PORT = 3000;
+app.use(bodyParser.json());
 
-// --- اضبط القيم دي --- //
+// --- إعداد القيم الأساسية --- //
 const ULTRA_INSTANCE_ID = "instance142984";
 const ULTRA_TOKEN = "799w3nqqj4fbwxt9";
 const ULTRA_SEND_URL = `https://api.ultramsg.com/${ULTRA_INSTANCE_ID}/messages/chat`;
 
 const SARWA_API_BASE = "https://sl-portal.sarwa.insurance/ords/sl_ws/MEMBERS";
 const SARWA_LOG_API = "https://sl-portal.sarwa.insurance/ords/sl_ws/discussion/messages"; 
-const SECRET_KEY = "your_super_secret_key_here_change_this"; // غير هذا لمفتاح سري قوي وآمن
-// ---------------------- //
+const SECRET_KEY = "your_super_secret_key_here_change_this"; 
+// ------------------------------ //
 
-app.use(bodyParser.json());
-
-// تخزين الـ hashes اللي تم معالجتها لمنع التكرار
+// ذاكرة مؤقتة
 const processedMessages = new Set();
-// تخزين المستخدمين اللي تم الترحيب بيهم
 const welcomedUsers = new Set();
-// تخزين بيانات المستخدمين اللي اتحققوا
 const verifiedUsers = new Map();
 
-// للتأكد من ان السيرفر شغال
-app.get("/", (req, res) => res.send("✅ Server is running"));
+// Endpoint للتجربة
+app.get("/", (req, res) => res.send("✅ Server is running on Vercel"));
 
-// Webhook endpoint
-app.post("/ultramsgwebhook", async (req, res) => {
+// Webhook الرئيسي
+app.post("/", async (req, res) => {
   try {
-    console.log("📩 Incoming Webhook (trim):", JSON.stringify(req.body).slice(0, 1500));
-
     const data = req.body.data || req.body;
-    const from = data.from;                 
+    const from = data.from;
+    const cleanFrom = from.split("@")[0];
     const rawBody = (data.body || "").toString().trim();
-    const messageHash = req.body.hash; // الـ hash بتاع الرسالة
+    const messageHash = req.body.hash;
 
     console.log("👤 From:", from);
     console.log("💬 Body:", rawBody);
-    console.log("🔑 Hash:", messageHash);
 
-    // تنظيف رقم التليفون من @c.us
-    const cleanFrom = from.split('@')[0];
-
-    // 1. التحقق من إن الرسالة مش مكررة
-    if (processedMessages.has(messageHash)) {
-      console.log("🔄 Duplicate message ignored, hash:", messageHash);
-      return res.sendStatus(200);
-    }
+    // تجاهل الرسائل المكررة
+    if (processedMessages.has(messageHash)) return res.sendStatus(200);
     processedMessages.add(messageHash);
 
-    // 2. سجل رسالة العميل
+    // سجل الرسالة الواردة
     await logMessage({
       member_id: null,
       message: rawBody,
@@ -59,143 +47,96 @@ app.post("/ultramsgwebhook", async (req, res) => {
       user_number: cleanFrom
     });
 
-    // 3. لو العميل اتحقق
+    // لو المستخدم معروف
     if (verifiedUsers.has(from)) {
-      // التأكد إن الإدخال هو 1, 2, أو 3
       if (["1", "2", "3"].includes(rawBody)) {
-        const userData = verifiedUsers.get(from);
-        const memberId = userData.memberId;
-        const cleanUserNumber = userData.userNumber.split('@')[0]; // إزالة @c.us
+        const { memberId, userNumber } = verifiedUsers.get(from);
+        const cleanUserNumber = userNumber.split("@")[0];
         let reply = "";
 
         if (rawBody === "1" || rawBody === "2") {
           const secureToken = createSecureToken(memberId, cleanUserNumber);
           const uploadUrl = `https://sl-portal.sarwa.insurance/ords/r/sl_ws/slportal10511020151201212044/document?p3_token=${secureToken}`;
           reply = `برجاء رفع المستندات المطلوبة (الكارنية الطبي، الروشتة، الفحوصات) عبر الرابط التالي:\n${uploadUrl}`;
-        } else if (rawBody === "3") {
+        } else {
           reply = "للاستفسارات برجاء الاتصال علي XXXX";
         }
 
         await sendUltraReply(from, reply);
         await logMessage({ member_id: memberId, message: reply, sender: "BOT", user_number: cleanFrom });
-      } else {
-        // لو الإدخال مش 1, 2, أو 3
-        const reply = "عذراً، لم أفهم طلبكم. برجاء اختيار أحد الخيارات المتاحة أو التواصل على رقم XXXX";
-        await sendUltraReply(from, reply);
-        await logMessage({ member_id: verifiedUsers.get(from).memberId, message: reply, sender: "BOT", user_number: cleanFrom });
+        return res.sendStatus(200);
       }
+
+      const reply = "عذراً، لم أفهم طلبكم. برجاء اختيار أحد الخيارات المتاحة.";
+      await sendUltraReply(from, reply);
+      await logMessage({ member_id: verifiedUsers.get(from).memberId, message: reply, sender: "BOT", user_number: cleanFrom });
       return res.sendStatus(200);
     }
 
-    // 4. لو دي أول رسالة من المستخدم
+    // أول مرة
     if (!welcomedUsers.has(from)) {
       const reply = "مرحباً بكم في ثروة لتأمينات الحياة!\nبرجاء إدخال رقم الكارت الطبي الخاص بكم للمتابعة.";
       await sendUltraReply(from, reply);
       await logMessage({ member_id: null, message: reply, sender: "BOT", user_number: cleanFrom });
-      welcomedUsers.add(from); // إضافة المستخدم للترحيب
+      welcomedUsers.add(from);
       return res.sendStatus(200);
     }
 
-    // 5. التحقق من إن الإدخال أرقام فقط
+    // تحقق من الرقم
     const memberId = rawBody.replace(/\D/g, "");
     if (!memberId || !/^\d+$/.test(rawBody)) {
-      const reply = "برجاء إدخال رقم الكارت الطبي الصحيح أو التواصل على XXXX أو إرسال طلبكم عبر البريد Chronic@Sarwa.life";
+      const reply = "برجاء إدخال رقم الكارت الطبي الصحيح أو التواصل على XXXX.";
       await sendUltraReply(from, reply);
       await logMessage({ member_id: null, message: reply, sender: "BOT", user_number: cleanFrom });
       return res.sendStatus(200);
     }
 
-    // 6. استدعاء Sarwa ORDS API
+    // تحقق من ORDS
     const ordsUrl = `${SARWA_API_BASE}/${encodeURIComponent(memberId)}`;
     console.log("🔍 Calling Sarwa ORDS:", ordsUrl);
 
-    let sarwaJson = null;
-    try {
-      const r = await fetch(ordsUrl, { method: "GET" });
-      sarwaJson = await r.json();
-      console.log("🔎 Sarwa response (count):", sarwaJson.count || (sarwaJson.items && sarwaJson.items.length));
-    } catch (err) {
-      console.error("❌ Error calling Sarwa API:", err && err.message ? err.message : err);
-      const reply = "حصل خطأ أثناء التحقق من النظام، برجاء المحاولة لاحقًا.";
-      await sendUltraReply(from, reply);
-      await logMessage({ member_id: null, message: reply, sender: "BOT", user_number: cleanFrom });
-      return res.sendStatus(200);
-    }
+    const r = await fetch(ordsUrl);
+    const sarwaJson = await r.json();
 
-    // 7. بناء الرد
-    let reply = "برجاء إدخال رقم الكارت الطبي الصحيح أو التواصل على XXXX أو إرسال طلبكم عبر البريد Chronic@Sarwa.life";
+    let reply = "برجاء إدخال رقم الكارت الطبي الصحيح.";
     let detectedMemberId = null;
-    if (sarwaJson && Array.isArray(sarwaJson.items) && sarwaJson.items.length > 0) {
+
+    if (sarwaJson?.items?.length > 0) {
       const member = sarwaJson.items[0];
       const name = member.member_name || member.MEMBER_NAME || "العميل";
-      detectedMemberId = member.member_id || member.MEMBER_ID || null;
+      detectedMemberId = member.member_id || member.MEMBER_ID;
 
       reply = `أهلاً ${name}، كيف يمكننا مساعدتك اليوم؟\n1 - لإضافة علاج شهري جديد\n2 - لتعديل علاج شهري\n3 - للاستفسارات`;
 
-      // نخزن الـ memberId والاسم + userNumber
-      verifiedUsers.set(from, { memberId: detectedMemberId, name: name, userNumber: cleanFrom });
+      verifiedUsers.set(from, { memberId: detectedMemberId, name, userNumber: cleanFrom });
     }
 
-    // 8. أرسل الرد عبر Ultramsg
-    const sendResult = await sendUltraReply(from, reply);
-    console.log("📤 Ultramsg send result:", JSON.stringify(sendResult).slice(0, 1000));
-
-    // 9. سجل رد البوت
-    await logMessage({
-      member_id: detectedMemberId,
-      message: reply,
-      sender: "BOT",
-      user_number: cleanFrom
-    });
-
-    return res.sendStatus(200);
+    await sendUltraReply(from, reply);
+    await logMessage({ member_id: detectedMemberId, message: reply, sender: "BOT", user_number: cleanFrom });
+    res.sendStatus(200);
   } catch (err) {
-    console.error("❌ Webhook handler unexpected error:", err);
-    return res.sendStatus(200);
+    console.error("❌ Webhook Error:", err);
+    res.sendStatus(200);
   }
 });
 
-// دالة لتخزين الرسائل في جدول SL_MEMBER_LOG_CHAT_BOT_MASTER عبر ORDS API
+// دالة تسجيل الرسائل
 async function logMessage({ member_id, message, sender, user_number }) {
   try {
-    const memberIdVal = (member_id === null || member_id === undefined || member_id === "") ? null : Number(member_id);
-    const cleanUserNumber = user_number.split('@')[0]; // إزالة @c.us
-
-    const body = {
-      member_id: memberIdVal,
-      message: message || null,
-      sender: sender || null,
-      user_number: cleanUserNumber
-    };
-
-    console.log("🟢 logMessage -> sending to ORDS:", JSON.stringify(body));
-
+    const cleanUser = user_number.split("@")[0];
+    const body = { member_id, message, sender, user_number: cleanUser };
     const resp = await fetch(SARWA_LOG_API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-
-    const json = await resp.json(); // توقع JSON response
-    console.log("📝 ORDS response status:", resp.status);
-    console.log("📝 ORDS response body:", JSON.stringify(json));
-
-    if (!resp.ok) {
-      console.error("❌ ORDS returned non-OK for logMessage:", resp.status, JSON.stringify(json));
-    } else if (json.status && json.status.includes('ERROR')) {
-      console.error("❌ ORDS returned error status:", json.status);
-    } else {
-      console.log("✅ Message logged successfully:", json.status);
-    }
-
-    return { status: resp.status, body: json };
+    console.log("🟢 logMessage Status:", resp.status);
   } catch (err) {
-    console.error("❌ logMessage error:", err && err.message ? err.message : err);
-    return { error: err ? err.message : "unknown" };
+    console.error("❌ logMessage error:", err.message);
   }
 }
 
-// دالة مساعدة لإرسال رسالة عبر Ultramsg
+// إرسال رسالة
 async function sendUltraReply(to, text) {
   try {
     const params = new URLSearchParams();
@@ -208,31 +149,20 @@ async function sendUltraReply(to, text) {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: params.toString()
     });
-
-    const contentType = resp.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      const json = await resp.json();
-      return { status: resp.status, body: json };
-    } else {
-      const textBody = await resp.text();
-      return { status: resp.status, body: textBody };
-    }
+    console.log("📤 Sent to:", to);
   } catch (err) {
-    console.error("❌ sendUltraReply error:", err);
-    return { error: err.toString() };
+    console.error("❌ sendUltraReply error:", err.message);
   }
 }
 
-// دالة لإنشاء توكن آمن
+// إنشاء توكن
 function createSecureToken(memberId, userNumber) {
-  const cleanUserNumber = userNumber.split('@')[0]; // إزالة @c.us
   const timestamp = Date.now();
-  const data = `${memberId}:${cleanUserNumber}:${timestamp}`;
-  const hmac = crypto.createHmac('sha256', SECRET_KEY);
+  const data = `${memberId}:${userNumber}:${timestamp}`;
+  const hmac = crypto.createHmac("sha256", SECRET_KEY);
   hmac.update(data);
-  const signature = hmac.digest('hex');
-  const tokenData = `${data}:${signature}`;
-  return Buffer.from(tokenData).toString('base64');
+  const signature = hmac.digest("hex");
+  return Buffer.from(`${data}:${signature}`).toString("base64");
 }
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+export default app;
